@@ -496,5 +496,118 @@ print("  本批发布号:", [r["publication_id"] for r in d["batch"]["releases"]
       "| has_more:", d["has_more"])
 '
 
+# ---------------------------------------------------------------
+# 责任区成员站隔离时段（数据不可信）：在新站 9、10 与责任区 4 上完整演示
+# ---------------------------------------------------------------
+
+step "54. 隔离演示准备：登记两站与设备，各补 3 条读数（13:00/13:05/13:10），组 K=2 责任区"
+curl -s -X POST "$BASE/stations" -H "$J" \
+  -d '{"name":"西陵站","rise_threshold":10.0,"clear_threshold":8.0}' > /dev/null
+curl -s -X POST "$BASE/stations" -H "$J" \
+  -d '{"name":"东陵站","rise_threshold":10.0,"clear_threshold":8.0}' > /dev/null
+curl -s -X POST "$BASE/stations/9/devices" -H "$J" -d '{"device_no":"DEV-010"}' > /dev/null
+curl -s -X POST "$BASE/stations/10/devices" -H "$J" -d '{"device_no":"DEV-011"}' > /dev/null
+for D in DEV-010 DEV-011; do
+  for m in 00 05 10; do
+    curl -s -X POST "$BASE/readings" -H "$J" \
+      -d "{\"device_no\":\"$D\",\"seq\":13$m,\"observed_at\":\"2026-10-01T13:$m:00+08:00\",\"water_level\":12.0}" > /dev/null
+  done
+done
+curl -s -X POST "$BASE/zones" -H "$J" \
+  -d '{"name":"陵川片区","effective_at":"2026-10-01T13:00:00+08:00","station_ids":[9,10],"trigger_count":2}' > /dev/null
+echo "隔离前区域 4: $(curl -s "$BASE/zones/4/timeline" \
+  | python3 -c 'import sys,json;z=json.load(sys.stdin);print(z["status"], [(e["type"],e["at"]) for e in z["events"]])')"
+
+step "55. 登记隔离时段：站 10 在 13:20~13:40 数据不可信（[开始,结束)，退出本区联动计数）"
+curl -s -X POST "$BASE/zones/4/station-isolations" -H "$J" \
+  -d '{"station_id":10,"start_at":"2026-10-01T13:20:00+08:00","end_at":"2026-10-01T13:40:00+08:00","reason":"遥测中断，数据不可信"}' \
+  | python3 -c '
+import sys, json
+d = json.load(sys.stdin)
+i = d["isolation"]
+print("隔离记录", i["id"], "| 站", i["station_id"], "| 区间 [", i["start_at"], ",", i["end_at"], ")")
+p = d["pending_zone"]
+print("登记后待发布区域:", p["status"], "| 事件:",
+      [(e["type"], e["at"], e["warning_station_ids"]) for e in p["events"]])
+print("（开始刻 13:20 退出计数 → 解除；结束刻 13:40 无新读数也按该刻站状态重入 → 再预警）")
+'
+
+step "56. 查询隔离记录（按开始时刻升序；可按 station_id 过滤）"
+curl -s "$BASE/zones/4/station-isolations" | python3 -c '
+import sys, json
+for i in json.load(sys.stdin)["isolations"]:
+    print("  隔离", i["id"], "站", i["station_id"], "[", i["start_at"], ",", i["end_at"], ") |", i["reason"])
+'
+
+step "57. 隔离校验：非成员/早于生效/结束不晚于开始/无时区/空原因 400，未知区/站 404，重叠 409，邻接 201"
+curl -s -o /dev/null -w '非成员站(站8)       → HTTP %{http_code}\n' -X POST "$BASE/zones/4/station-isolations" -H "$J" \
+  -d '{"station_id":8,"start_at":"2026-10-01T13:20:00+08:00","end_at":"2026-10-01T13:50:00+08:00","reason":"x"}'
+curl -s -o /dev/null -w '未知责任区          → HTTP %{http_code}\n' -X POST "$BASE/zones/999/station-isolations" -H "$J" \
+  -d '{"station_id":10,"start_at":"2026-10-01T13:20:00+08:00","end_at":"2026-10-01T13:50:00+08:00","reason":"x"}'
+curl -s -o /dev/null -w '未知监测站          → HTTP %{http_code}\n' -X POST "$BASE/zones/4/station-isolations" -H "$J" \
+  -d '{"station_id":999,"start_at":"2026-10-01T13:20:00+08:00","end_at":"2026-10-01T13:50:00+08:00","reason":"x"}'
+curl -s -o /dev/null -w '开始早于区生效时刻  → HTTP %{http_code}\n' -X POST "$BASE/zones/4/station-isolations" -H "$J" \
+  -d '{"station_id":10,"start_at":"2026-10-01T12:50:00+08:00","end_at":"2026-10-01T13:50:00+08:00","reason":"x"}'
+curl -s -o /dev/null -w '结束等于开始        → HTTP %{http_code}\n' -X POST "$BASE/zones/4/station-isolations" -H "$J" \
+  -d '{"station_id":10,"start_at":"2026-10-01T13:50:00+08:00","end_at":"2026-10-01T13:50:00+08:00","reason":"x"}'
+curl -s -o /dev/null -w '开始不带时区        → HTTP %{http_code}\n' -X POST "$BASE/zones/4/station-isolations" -H "$J" \
+  -d '{"station_id":10,"start_at":"2026-10-01T13:50:00","end_at":"2026-10-01T14:10:00+08:00","reason":"x"}'
+curl -s -o /dev/null -w '空白原因            → HTTP %{http_code}\n' -X POST "$BASE/zones/4/station-isolations" -H "$J" \
+  -d '{"station_id":10,"start_at":"2026-10-01T13:50:00+08:00","end_at":"2026-10-01T14:10:00+08:00","reason":"   "}'
+curl -s -o /dev/null -w '与既有区间重叠      → HTTP %{http_code}\n' -X POST "$BASE/zones/4/station-isolations" -H "$J" \
+  -d '{"station_id":10,"start_at":"2026-10-01T13:30:00+08:00","end_at":"2026-10-01T13:50:00+08:00","reason":"重叠"}'
+curl -s -o /dev/null -w '邻接(13:40起)允许   → HTTP %{http_code}\n' -X POST "$BASE/zones/4/station-isolations" -H "$J" \
+  -d '{"station_id":10,"start_at":"2026-10-01T13:40:00+08:00","end_at":"2026-10-01T14:00:00+08:00","reason":"续报不可信"}'
+
+step "58. 邻接两段合成连续隔离：区域 14:00 才重入预警；本站裁定不变、K 不降低"
+curl -s "$BASE/zones/4/timeline" | python3 -c '
+import sys, json
+z = json.load(sys.stdin)
+print("区域 4:", z["status"], "| K =", z["trigger_count"], "| 事件:",
+      [(e["type"], e["at"], e["warning_station_ids"]) for e in z["events"]])
+'
+echo "站 10 本站裁定（不受隔离影响）: $(curl -s "$BASE/stations/10/timeline" | python3 -c 'import sys,json;print(json.load(sys.stdin)["status"])')"
+
+step "59. 发布冻结：公开区域 4 含隔离后的 3 条事件"
+curl -s -X POST "$BASE/publish" -H "$J" -d '{"note":"隔离演示发布"}' > /dev/null
+curl -s "$BASE/public/zones/4/timeline" | python3 -c '
+import sys, json
+z = json.load(sys.stdin)
+print("公开区域 4（发布号", z["publication_id"], "）:", z["status"],
+      [(e["type"], e["at"]) for e in z["events"]])
+'
+
+step "60. 追溯登记使核对凭证失效：核对后登记站 9 的 13:10~13:30 隔离 → 确认 409"
+T=$(curl -s -X POST "$BASE/publish/checks" | python3 -c 'import sys,json;print(json.load(sys.stdin)["token"])')
+curl -s -X POST "$BASE/zones/4/station-isolations" -H "$J" \
+  -d '{"station_id":9,"start_at":"2026-10-01T13:10:00+08:00","end_at":"2026-10-01T13:30:00+08:00","reason":"追溯：该站时钟漂移"}' > /dev/null
+curl -s -w '追溯隔离后拿旧凭证确认 → HTTP %{http_code}（data_changed_after_check）\n' -o /dev/null \
+  -X POST "$BASE/publish/confirm" -H "$J" -d "{\"token\":\"$T\"}"
+
+step "61. 追溯重算：站 9 的 13:10 预警被隔离 → 原区域预警消失；公开快照须重新发布才更新"
+echo "待发布区域 4: $(curl -s "$BASE/zones/4/timeline" \
+  | python3 -c 'import sys,json;z=json.load(sys.stdin);print(z["status"], [(e["type"],e["at"]) for e in z["events"]])')"
+echo "公开区域 4（仍冻结）: $(curl -s "$BASE/public/zones/4/timeline" \
+  | python3 -c 'import sys,json;z=json.load(sys.stdin);print([(e["type"],e["at"]) for e in z["events"]])')"
+PUBS_BEFORE=$(curl -s "$BASE/publications" | python3 -c 'import sys,json;print(len(json.load(sys.stdin)))')
+curl -s -X POST "$BASE/publish" -H "$J" -d '{"note":"追溯隔离后重新发布"}' > /dev/null
+echo "重新发布后公开区域 4: $(curl -s "$BASE/public/zones/4/timeline" \
+  | python3 -c 'import sys,json;z=json.load(sys.stdin);print([(e["type"],e["at"]) for e in z["events"]])')"
+echo "发布快照数: $PUBS_BEFORE -> $(curl -s "$BASE/publications" | python3 -c 'import sys,json;print(len(json.load(sys.stdin)))')（仅新增，历史快照不改写）"
+
+step "62. 重新发布的区域变化进入下游批次差异（新消费方回放可见新增/撤销）"
+SUB2=$(curl -s -X POST "$BASE/subscribers" -H "$J" -d '{"name":"隔离演示下游"}')
+SKEY2=$(echo "$SUB2" | python3 -c 'import sys,json;print(json.load(sys.stdin)["key"])')
+curl -s -H "X-Subscriber-Key: $SKEY2" "$BASE/subscriber/releases?limit=100" | python3 -c '
+import sys, json
+d = json.load(sys.stdin)
+for r in d["batch"]["releases"]:
+    for z in r["zones"]:
+        if z["zone_id"] == 4 and (z["new_object"] or z["events_added"] or z["events_removed"]):
+            print("  发布", r["publication_id"], "区域4:", z["status_before"], "->", z["status_after"],
+                  "新增", [(e["type"], e["at"]) for e in z["events_added"]],
+                  "撤销", [(e["type"], e["at"]) for e in z["events_removed"]])
+'
+
 echo
 echo "演示完成。交互式文档：$BASE/docs"

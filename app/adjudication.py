@@ -200,6 +200,9 @@ class ZoneReplayResult:
     status: str        # "normal" | "warning"（截至最后一条变化后的区域状态）
     events: List[ZoneEvent] = field(default_factory=list)
     active_warning_since: Optional[datetime] = None
+    # 重放结束后仍计入联动的预警成员站 ID（升序）；
+    # 成员站隔离时段通过合成状态变化体现，故此处已排除隔离中的站
+    warning_station_ids: tuple = ()
 
 
 def replay_zone(
@@ -258,6 +261,7 @@ def replay_zone(
             )
 
     result.status = zone_status
+    result.warning_station_ids = tuple(sorted(warning_set))
     if zone_status == "warning":
         for e in reversed(result.events):
             if e.type == "warning":

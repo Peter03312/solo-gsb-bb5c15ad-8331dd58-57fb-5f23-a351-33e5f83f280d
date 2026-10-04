@@ -34,6 +34,7 @@ from .schemas import (
     ThresholdVersionCreate,
     VoidRequest,
     ZoneCreate,
+    ZoneStationIsolationCreate,
 )
 
 # 预演（不落库）时候选阈值版本在时间线中的临时 id：正式登记后会换成真实版本 id。
@@ -173,8 +174,8 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
 
     app = FastAPI(
         title="山洪水位预警裁定服务",
-        version="1.6.0",
-        description="监测站/设备登记、汛期一站多设备轮值接管选数、读数补传（幂等）、审核修订、阈值版本（含不落库预演）、单站预警裁定、防汛责任区跨站联动、受控发布（核对凭证 → 确认冻结），以及下游值班系统断点领取（一次性密钥登记、按批拉取已冻结发布差异、末编号确认、游标独立可续读）。",
+        version="1.7.0",
+        description="监测站/设备登记、汛期一站多设备轮值接管选数、读数补传（幂等）、审核修订、阈值版本（含不落库预演）、单站预警裁定、防汛责任区跨站联动（含成员站数据不可信隔离时段）、受控发布（核对凭证 → 确认冻结），以及下游值班系统断点领取（一次性密钥登记、按批拉取已冻结发布差异、末编号确认、游标独立可续读）。",
     )
     app.state.db = db
     app.state.settings = settings
@@ -423,7 +424,10 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         - threshold_overrides：{station_id: [不落库候选版本]}（仅预演使用）——
           目标站按候选版本预演，其他成员站沿用现有待发布结果参与联动；
         - 生效时刻之前仍在预警的站计入初始状态，初始满足 K 即在生效时刻预警；
-        - 同一时刻先合并所有站变化，再按 K 判定，每个时刻最多一个区域事件。
+        - 同一时刻先合并所有站变化，再按 K 判定，每个时刻最多一个区域事件；
+        - 成员站隔离时段（zone_station_isolations）：[start, end) 内该站退出本责任区的
+          联动计数（本站裁定、其他责任区与触发站数 K 均不变）；隔离开始 / 结束两刻
+          即使没有新读数，也按该刻站状态重新裁定，并与同刻站状态变化合并。
         """
         zone = conn.execute("SELECT * FROM zones WHERE id=?", (zone_id,)).fetchone()
         if zone is None:
@@ -434,6 +438,17 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
 
         overrides = threshold_overrides or {}
 
+        # 本责任区已登记的成员站隔离时段（按站分组，各自按开始时刻升序）
+        isolation_rows = conn.execute(
+            "SELECT * FROM zone_station_isolations WHERE zone_id=? ORDER BY start_at, id",
+            (zone_id,),
+        ).fetchall()
+        isolations_by_station: dict[int, list[tuple[datetime, datetime]]] = {}
+        for row in isolation_rows:
+            isolations_by_station.setdefault(row["station_id"], []).append(
+                (parse_stored(row["start_at"]), parse_stored(row["end_at"]))
+            )
+
         changes: list[StationStateChange] = []
         initial_warning: list[int] = []
         member_status: list[dict[str, Any]] = []
@@ -441,28 +456,64 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             station_id = m["id"]
             # 同一请求内同一站只裁定一次（预演与正式路径共用同一时间线结果）
             tl = compute_timeline(conn, station_id, overrides.get(station_id))
+            # 该站全部事件（含生效前），供隔离结束时刻取“该刻站状态”使用
+            station_events = [
+                (
+                    parse_stored(ev["at"]),
+                    "warning" if ev["type"] == "warning" else "normal",
+                    ev["reading_id"],
+                )
+                for ev in tl["events"]
+            ]
             last_before: Optional[str] = None
-            for ev in tl["events"]:
-                ev_at = parse_stored(ev["at"])
-                if ev_at >= effective_at:
-                    changes.append(
-                        StationStateChange(
-                            station_id=station_id,
-                            at=ev_at,
-                            state="warning" if ev["type"] == "warning" else "normal",
-                            order=ev["reading_id"],
-                        )
-                    )
-                else:
-                    last_before = ev["type"]
+            for ev_at, state, _ in station_events:
+                if ev_at < effective_at:
+                    last_before = state
             # 生效之前最后一个事件为预警（且其后没有解除）→ 生效时仍在预警
             if last_before == "warning":
                 initial_warning.append(station_id)
+
+            isolations = isolations_by_station.get(station_id, [])
+
+            def state_before(moment: datetime, _events=station_events) -> str:
+                """该站某时刻之前（不含该刻）的真实状态（隔离不影响本站裁定本身）。"""
+                state = "normal"
+                for ev_at, st, _ in _events:
+                    if ev_at < moment:
+                        state = st
+                    else:
+                        break
+                return state
+
+            # 真实状态变化：自生效时刻起、且未落在本区隔离时段内的才进入联动重放
+            for ev_at, state, reading_id in station_events:
+                if ev_at < effective_at:
+                    continue
+                if any(start <= ev_at < end for start, end in isolations):
+                    continue  # 隔离期内该站变化不计入本责任区联动（其他责任区不受影响）
+                changes.append(
+                    StationStateChange(
+                        station_id=station_id, at=ev_at, state=state, order=reading_id
+                    )
+                )
+            # 隔离边界的合成状态变化（即使没有新读数也按该刻站状态重新裁定）：
+            # 开始刻该站退出联动计数；结束刻按结束时刻（不含）之前的站状态重新计入。
+            # 合成变化与同刻真实变化在同一 tick 合并（order=-1 排在读数事件之前，
+            # 同刻真实事件的状态最终生效），每刻最多一条区域事件。
+            for start, end in isolations:
+                changes.append(
+                    StationStateChange(station_id=station_id, at=start, state="normal", order=-1)
+                )
+                changes.append(
+                    StationStateChange(
+                        station_id=station_id, at=end, state=state_before(end), order=-1
+                    )
+                )
             member_status.append(
                 {
                     "station_id": station_id,
                     "station_name": m["name"],
-                    # 该站截至当前（待发布）是否仍在预警
+                    # 该站截至当前（待发布）是否仍在预警（本站裁定，不受隔离影响）
                     "warning": tl["status"] == "warning",
                     "warning_before_effective": last_before == "warning",
                 }
@@ -477,10 +528,9 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                 iso_z(replay.active_warning_since) if replay.active_warning_since else None
             ),
             "trigger_count": trigger_count,
-            "warning_station_count": sum(1 for ms in member_status if ms["warning"]),
-            "warning_station_ids": sorted(
-                ms["station_id"] for ms in member_status if ms["warning"]
-            ),
+            # 当前计入联动的预警站（隔离中的站不计入；触发站数 K 不降低）
+            "warning_station_count": len(replay.warning_station_ids),
+            "warning_station_ids": list(replay.warning_station_ids),
             "events": [
                 {
                     "type": e.type,
@@ -1178,6 +1228,136 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             "published_at": row["published_at"],
             "published": True,
             **json.loads(row["timeline_json"]),
+        }
+
+    # ------------------------------------------------------------ 责任区成员站隔离时段（数据不可信）
+
+    def isolation_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "id": row["id"],
+            "zone_id": row["zone_id"],
+            "station_id": row["station_id"],
+            "start_at": iso_z(parse_stored(row["start_at"])),
+            "end_at": iso_z(parse_stored(row["end_at"])),
+            "reason": row["reason"],
+            "created_at": row["created_at"],
+        }
+
+    @app.post("/zones/{zone_id}/station-isolations", status_code=201, tags=["责任区隔离"])
+    def create_zone_station_isolation(zone_id: int, body: ZoneStationIsolationCreate) -> dict[str, Any]:
+        """登记责任区成员站的隔离时段（数据不可信期间退出本区联动计数）。
+
+        - 区间为 [start_at, end_at)：开始含、结束不含；起止均须带时区、原因非空，
+          end_at 须晚于 start_at，否则 400；
+        - start_at 不得早于责任区生效时刻，否则 400；
+        - 同区同站区间不得重叠（邻接 end==start 允许）→ 409；
+        - 责任区不存在 → 404；监测站不存在 → 404；站非本区成员 → 400；
+        - 隔离仅排除该站在本责任区的联动计数：本站裁定、其他责任区与触发站数 K 均不变；
+          隔离开始 / 结束两刻即使没有新读数，也按该刻站状态重新裁定；
+        - 登记（含追溯）即时重算待发布区域结果并使既有发布核对凭证失效；
+          历史发布快照不变，公开结果须重新发布才更新。
+        """
+        start_utc = body.start_at.astimezone(timezone.utc)
+        end_utc = body.end_at.astimezone(timezone.utc)
+        start_str = start_utc.isoformat()
+        end_str = end_utc.isoformat()
+        now = iso_z(utc_now())
+        with db.write_tx() as conn:
+            zone = conn.execute("SELECT * FROM zones WHERE id=?", (zone_id,)).fetchone()
+            if zone is None:
+                raise HTTPException(status_code=404, detail=f"责任区 {zone_id} 不存在")
+            station = conn.execute(
+                "SELECT * FROM stations WHERE id=?", (body.station_id,)
+            ).fetchone()
+            if station is None:
+                raise HTTPException(status_code=404, detail=f"监测站 {body.station_id} 不存在")
+            member = conn.execute(
+                "SELECT 1 FROM zone_members WHERE zone_id=? AND station_id=?",
+                (zone_id, body.station_id),
+            ).fetchone()
+            if member is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "message": f"监测站 {body.station_id} 不是责任区 {zone_id} 的成员站",
+                        "zone_id": zone_id,
+                        "station_id": body.station_id,
+                    },
+                )
+            zone_effective = parse_stored(zone["effective_at"])
+            if start_utc < zone_effective:
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "message": "隔离开始时刻不得早于责任区生效时刻",
+                        "zone_effective_at": iso_z(zone_effective),
+                        "start_at": iso_z(start_utc),
+                    },
+                )
+            # 同区同站区间重叠检查（[start, end) 半开区间，邻接 end==start 允许）：
+            # 重叠 ⇔ 既有.start < 新.end 且 新.start < 既有.end
+            overlap = conn.execute(
+                """
+                SELECT id, start_at, end_at FROM zone_station_isolations
+                WHERE zone_id=? AND station_id=? AND start_at < ? AND ? < end_at
+                ORDER BY start_at, id LIMIT 1
+                """,
+                (zone_id, body.station_id, end_str, start_str),
+            ).fetchone()
+            if overlap is not None:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "message": "与已登记的隔离时段重叠（邻接允许，重叠拒绝）",
+                        "existing_isolation_id": overlap["id"],
+                        "existing_start_at": iso_z(parse_stored(overlap["start_at"])),
+                        "existing_end_at": iso_z(parse_stored(overlap["end_at"])),
+                    },
+                )
+            cur = conn.execute(
+                """
+                INSERT INTO zone_station_isolations(zone_id, station_id, start_at, end_at,
+                                                    reason, created_at)
+                VALUES (?,?,?,?,?,?)
+                """,
+                (zone_id, body.station_id, start_str, end_str, body.reason, now),
+            )
+            row = conn.execute(
+                "SELECT * FROM zone_station_isolations WHERE id=?", (cur.lastrowid,)
+            ).fetchone()
+            timeline = compute_zone_timeline(conn, zone_id)
+            # 隔离登记（含追溯）影响联动裁定 → 推进数据版本，作废此前的受控发布核对凭证
+            bump_data_version(conn)
+        return {
+            "isolation": isolation_to_dict(row),
+            "pending_zone": {
+                "zone_id": zone_id,
+                "status": timeline["status"],
+                "warning_station_ids": timeline["warning_station_ids"],
+                "warning_station_count": timeline["warning_station_count"],
+                "events": timeline["events"],
+            },
+        }
+
+    @app.get("/zones/{zone_id}/station-isolations", tags=["责任区隔离"])
+    def list_zone_station_isolations(
+        zone_id: int, station_id: Optional[int] = None
+    ) -> dict[str, Any]:
+        """查询责任区成员站隔离时段（按开始时刻升序；可按 station_id 过滤）。"""
+        with db.read() as conn:
+            zone = conn.execute("SELECT * FROM zones WHERE id=?", (zone_id,)).fetchone()
+            if zone is None:
+                raise HTTPException(status_code=404, detail=f"责任区 {zone_id} 不存在")
+            sql = "SELECT * FROM zone_station_isolations WHERE zone_id=?"
+            params: list[Any] = [zone_id]
+            if station_id is not None:
+                sql += " AND station_id=?"
+                params.append(station_id)
+            sql += " ORDER BY start_at, id"
+            rows = conn.execute(sql, params).fetchall()
+        return {
+            "zone_id": zone_id,
+            "isolations": [isolation_to_dict(r) for r in rows],
         }
 
     # ------------------------------------------------------------ 发布（冻结公开结果）

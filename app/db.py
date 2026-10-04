@@ -116,6 +116,22 @@ CREATE TABLE IF NOT EXISTS publication_zones (
     PRIMARY KEY (publication_id, zone_id)
 );
 
+-- 责任区成员站隔离时段：数据不可信期间该站退出本责任区的联动计数
+-- （本站裁定、其他责任区与触发站数 K 均不受影响）。
+-- 区间 [start_at, end_at)：开始含、结束不含；同区同站区间不得重叠（邻接允许）。
+CREATE TABLE IF NOT EXISTS zone_station_isolations (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    zone_id      INTEGER NOT NULL REFERENCES zones(id),
+    station_id   INTEGER NOT NULL REFERENCES stations(id),  -- 登记时须为该责任区成员站
+    start_at     TEXT NOT NULL,   -- 隔离开始（UTC ISO8601，含）；不得早于责任区生效时刻
+    end_at       TEXT NOT NULL,   -- 隔离结束（UTC ISO8601，不含）；须晚于开始
+    reason       TEXT NOT NULL,   -- 隔离原因（非空）
+    created_at   TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_zone_station_isolations
+    ON zone_station_isolations(zone_id, station_id, start_at);
+
 -- 应用元数据：data_version 为影响裁定的写入累计版本号（单调递增），
 -- 受控发布在确认时用它判断“核对后”是否发生过站点/设备/读数/阈值/责任区/发布写入。
 CREATE TABLE IF NOT EXISTS app_meta (

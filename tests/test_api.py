@@ -2629,3 +2629,376 @@ def test_concurrent_pull_same_subscriber_returns_same_batch(client, station, dev
         t.join()
     # 先到者建立批次 [1]，其余重复拉取返回同批
     assert batches == [[1]] * 6
+
+
+# ---------------------------------------------------------------- 责任区成员站隔离时段（数据不可信）
+
+def register_isolation(client, zone_id, station_id, start_min, end_min, reason="遥测中断，数据不可信"):
+    return client.post(
+        f"/zones/{zone_id}/station-isolations",
+        json={
+            "station_id": station_id,
+            "start_at": iso(BASE + timedelta(minutes=start_min)),
+            "end_at": iso(BASE + timedelta(minutes=end_min)),
+            "reason": reason,
+        },
+    )
+
+
+def zfmt(minutes):
+    return iso(BASE + timedelta(minutes=minutes)).replace("+00:00", "Z")
+
+
+def test_isolation_register_and_query(client):
+    s1, _ = make_station_with_device(client, "甲站", "D1")
+    s2, _ = make_station_with_device(client, "乙站", "D2")
+    zone_id = create_zone(client, [s1, s2], 0, 2).json()["id"]
+    r = register_isolation(client, zone_id, s1, 10, 20)
+    assert r.status_code == 201, r.text
+    body = r.json()
+    iso_rec = body["isolation"]
+    assert iso_rec["zone_id"] == zone_id
+    assert iso_rec["station_id"] == s1
+    assert iso_rec["start_at"] == zfmt(10)
+    assert iso_rec["end_at"] == zfmt(20)
+    assert iso_rec["reason"] == "遥测中断，数据不可信"
+    assert "created_at" in iso_rec
+    # 响应附带重算后的待发布区域结果
+    assert body["pending_zone"]["zone_id"] == zone_id
+    assert body["pending_zone"]["status"] == "normal"
+
+    # 再登记一段更早的与一段乙站的：列表按开始时刻升序，可按站过滤
+    register_isolation(client, zone_id, s2, 5, 8)
+    register_isolation(client, zone_id, s1, 30, 40)
+    lst = client.get(f"/zones/{zone_id}/station-isolations").json()
+    assert lst["zone_id"] == zone_id
+    assert [(i["station_id"], i["start_at"], i["end_at"]) for i in lst["isolations"]] == [
+        (s2, zfmt(5), zfmt(8)),
+        (s1, zfmt(10), zfmt(20)),
+        (s1, zfmt(30), zfmt(40)),
+    ]
+    only_s1 = client.get(f"/zones/{zone_id}/station-isolations", params={"station_id": s1}).json()
+    assert [i["start_at"] for i in only_s1["isolations"]] == [zfmt(10), zfmt(30)]
+    assert client.get(f"/zones/{zone_id}/station-isolations", params={"station_id": 999}).json()["isolations"] == []
+    # 责任区不存在 → 404
+    assert client.get("/zones/999/station-isolations").status_code == 404
+
+
+def test_isolation_validation_rejected(client):
+    s1, _ = make_station_with_device(client, "甲站", "D1")
+    s2, _ = make_station_with_device(client, "乙站", "D2")
+    zone_id = create_zone(client, [s1], 60, 1).json()["id"]  # 生效时刻 60，仅甲站为成员
+
+    # 起止不带时区 → 400
+    r = client.post(
+        f"/zones/{zone_id}/station-isolations",
+        json={"station_id": s1, "start_at": "2026-10-01T01:00:00", "end_at": zfmt(120), "reason": "x"},
+    )
+    assert r.status_code == 400
+    r = client.post(
+        f"/zones/{zone_id}/station-isolations",
+        json={"station_id": s1, "start_at": zfmt(60), "end_at": "2026-10-01T02:00:00", "reason": "x"},
+    )
+    assert r.status_code == 400
+    # 原因为空白 → 400
+    assert register_isolation(client, zone_id, s1, 60, 120, reason="   ").status_code == 400
+    # 结束不晚于开始（相等 / 更早）→ 400
+    assert register_isolation(client, zone_id, s1, 60, 60).status_code == 400
+    assert register_isolation(client, zone_id, s1, 120, 60).status_code == 400
+    # 开始早于责任区生效时刻 → 400
+    r = register_isolation(client, zone_id, s1, 59, 120)
+    assert r.status_code == 400
+    assert r.json()["detail"]["zone_effective_at"] == zfmt(60)
+    # 开始恰等于生效时刻 → 允许
+    assert register_isolation(client, zone_id, s1, 60, 120).status_code == 201
+    # 责任区不存在 → 404；监测站不存在 → 404；非成员站 → 400
+    assert register_isolation(client, 999, s1, 60, 120).status_code == 404
+    assert register_isolation(client, zone_id, 999, 120, 180).status_code == 404
+    r = register_isolation(client, zone_id, s2, 120, 180)
+    assert r.status_code == 400
+    assert "不是责任区" in r.json()["detail"]["message"]
+
+
+def test_isolation_overlap_conflict_adjacency_allowed(client):
+    s1, _ = make_station_with_device(client, "甲站", "D1")
+    s2, _ = make_station_with_device(client, "乙站", "D2")
+    zone_id = create_zone(client, [s1, s2], 0, 2).json()["id"]
+    first = register_isolation(client, zone_id, s1, 10, 20).json()["isolation"]
+
+    # 重叠（含完全相同、部分重叠、包含）→ 409，并给出既有记录
+    for start, end in ((10, 20), (15, 25), (5, 15), (0, 30), (12, 18)):
+        r = register_isolation(client, zone_id, s1, start, end)
+        assert r.status_code == 409, f"[{start},{end}) 应判重叠"
+        assert r.json()["detail"]["existing_isolation_id"] == first["id"]
+    # 不同时区表示的同一重叠瞬间同样 409（08:15+08:00 = 00:15Z）
+    r = client.post(
+        f"/zones/{zone_id}/station-isolations",
+        json={
+            "station_id": s1,
+            "start_at": "2026-10-01T08:15:00+08:00",
+            "end_at": "2026-10-01T08:25:00+08:00",
+            "reason": "重叠",
+        },
+    )
+    assert r.status_code == 409
+    # 邻接允许：end == 既有.start 或 start == 既有.end
+    assert register_isolation(client, zone_id, s1, 0, 10).status_code == 201
+    assert register_isolation(client, zone_id, s1, 20, 30).status_code == 201
+    # 同区不同站、同站不同区互不影响
+    assert register_isolation(client, zone_id, s2, 10, 20).status_code == 201
+    zone2 = create_zone(client, [s1], 0, 1, name="另一片区").json()["id"]
+    assert register_isolation(client, zone2, s1, 10, 20).status_code == 201
+
+
+def test_isolation_excludes_station_from_zone_count(client):
+    s1, d1 = make_station_with_device(client, "甲站", "D1")
+    s2, d2 = make_station_with_device(client, "乙站", "D2")
+    zone_id = create_zone(client, [s1, s2], 0, 2).json()["id"]
+    for d in (d1, d2):
+        for i, m in enumerate((0, 5, 10), start=1):
+            upload(client, d, i, m, 12.0)
+    tl = zone_timeline(client, zone_id)
+    assert [(e["type"], e["at"]) for e in tl["events"]] == [("warning", zfmt(10))]
+
+    # 乙站 20~40 数据不可信：隔离期间退出本区联动计数
+    r = register_isolation(client, zone_id, s2, 20, 40)
+    assert r.status_code == 201, r.text
+    pending = r.json()["pending_zone"]
+    # 开始/结束两刻即使没有新读数也重新裁定：20 退出 → 解除；40 按该刻站状态（仍预警）重新计入 → 再预警
+    assert [(e["type"], e["at"]) for e in pending["events"]] == [
+        ("warning", zfmt(10)),
+        ("cleared", zfmt(20)),
+        ("warning", zfmt(40)),
+    ]
+    tl = zone_timeline(client, zone_id)
+    assert tl["status"] == "warning"
+    assert tl["trigger_count"] == 2                      # 触发站数 K 不降低
+    assert tl["warning_station_ids"] == [s1, s2]         # 隔离结束后乙站重新计入
+    ev_cleared = tl["events"][1]
+    assert ev_cleared["warning_station_ids"] == [s1]     # 隔离中乙站不计数
+    assert ev_cleared["warning_station_count"] == 1
+    assert tl["events"][2]["warning_station_ids"] == [s1, s2]
+    # 本站裁定不变：乙站自身仍处于预警
+    st2 = timeline(client, s2)
+    assert st2["status"] == "warning"
+    assert [(e["type"], e["at"]) for e in st2["events"]] == [("warning", zfmt(10))]
+    # members 仍反映各站真实状态
+    assert {m["station_id"]: m["warning"] for m in tl["members"]} == {s1: True, s2: True}
+
+
+def test_isolation_half_open_boundaries(client):
+    s2, d2 = make_station_with_device(client, "乙站", "D2")
+    zone_id = create_zone(client, [s2], 0, 1).json()["id"]
+    # 乙站恰在 20 时刻预警（10/15/20 三条达阈值）
+    for i, m in enumerate((10, 15, 20), start=1):
+        upload(client, d2, i, m, 12.0)
+    assert timeline(client, s2)["events"][0]["at"] == zfmt(20)
+    # 隔离 [20,40)：开始含 —— 20 时刻的预警事件被隔离，不计入联动
+    register_isolation(client, zone_id, s2, 20, 40)
+    tl = zone_timeline(client, zone_id)
+    # 结束刻 40 按该刻之前站状态（预警）重新计入 → 区域在 40 预警
+    assert [(e["type"], e["at"]) for e in tl["events"]] == [("warning", zfmt(40))]
+    # 结束不含：乙站恰在 40 解除（35/40 两条低水位）→ 与结束刻重入同刻合并，真实解除生效
+    upload(client, d2, 4, 35, 7.0)
+    upload(client, d2, 5, 40, 7.0)
+    assert timeline(client, s2)["events"][-1]["type"] == "cleared"
+    tl = zone_timeline(client, zone_id)
+    assert tl["events"] == []          # 每刻最多一条区域事件：40 刻合并后不产生任何区域事件
+    assert tl["status"] == "normal"
+    assert tl["warning_station_ids"] == []
+
+
+def test_isolation_end_reentry_uses_state_at_end(client):
+    s1, d1 = make_station_with_device(client, "甲站", "D1")
+    s2, d2 = make_station_with_device(client, "乙站", "D2")
+    zone_id = create_zone(client, [s1, s2], 0, 2).json()["id"]
+    for d in (d1, d2):
+        for i, m in enumerate((0, 5, 10), start=1):
+            upload(client, d, i, m, 12.0)
+    register_isolation(client, zone_id, s2, 20, 40)
+    # 乙站在隔离期内解除（30 时刻）：该变化不进联动，但决定结束刻的重入状态
+    upload(client, d2, 4, 25, 7.0)
+    upload(client, d2, 5, 30, 7.0)
+    tl = zone_timeline(client, zone_id)
+    # 结束刻 40 乙站按该刻真实状态（已解除）重入 → 区域保持解除，无新事件
+    assert [(e["type"], e["at"]) for e in tl["events"]] == [
+        ("warning", zfmt(10)),
+        ("cleared", zfmt(20)),
+    ]
+    assert tl["status"] == "normal"
+    assert tl["warning_station_ids"] == [s1]
+
+
+def test_isolation_merges_with_same_moment_station_change(client):
+    s1, d1 = make_station_with_device(client, "甲站", "D1")
+    s2, d2 = make_station_with_device(client, "乙站", "D2")
+    zone_id = create_zone(client, [s1, s2], 0, 2).json()["id"]
+    for d in (d1, d2):
+        for i, m in enumerate((0, 5, 10), start=1):
+            upload(client, d, i, m, 12.0)
+    register_isolation(client, zone_id, s2, 20, 40)
+    # 甲站恰在隔离结束同刻（40）解除：与乙站重入合并判定 —— 40 刻合并后仅乙站在计数（1 < K）
+    upload(client, d1, 4, 35, 7.0)
+    upload(client, d1, 5, 40, 7.0)
+    tl = zone_timeline(client, zone_id)
+    assert [(e["type"], e["at"]) for e in tl["events"]] == [
+        ("warning", zfmt(10)),
+        ("cleared", zfmt(20)),
+    ]
+    assert tl["status"] == "normal"
+    assert tl["warning_station_ids"] == [s2]
+
+
+def test_isolation_other_zones_unaffected(client):
+    s1, d1 = make_station_with_device(client, "甲站", "D1")
+    s2, d2 = make_station_with_device(client, "乙站", "D2")
+    zone1 = create_zone(client, [s1, s2], 0, 2, name="片区一").json()["id"]
+    zone2 = create_zone(client, [s2], 0, 1, name="片区二").json()["id"]
+    for d in (d1, d2):
+        for i, m in enumerate((0, 5, 10), start=1):
+            upload(client, d, i, m, 12.0)
+    register_isolation(client, zone1, s2, 20, 40)
+    # 片区一：乙站退出计数；片区二：同一站不受影响，仍预警
+    assert [e["type"] for e in zone_timeline(client, zone1)["events"]] == [
+        "warning", "cleared", "warning",
+    ]
+    tl2 = zone_timeline(client, zone2)
+    assert tl2["status"] == "warning"
+    assert [(e["type"], e["at"]) for e in tl2["events"]] == [("warning", zfmt(10))]
+    assert tl2["warning_station_ids"] == [s2]
+
+
+def test_isolation_retroactive_recomputes_pending(client):
+    s1, d1 = make_station_with_device(client, "甲站", "D1")
+    s2, d2 = make_station_with_device(client, "乙站", "D2")
+    zone_id = create_zone(client, [s1, s2], 0, 2).json()["id"]
+    for d in (d1, d2):
+        for i, m in enumerate((0, 5, 10), start=1):
+            upload(client, d, i, m, 12.0)
+    assert zone_timeline(client, zone_id)["events"][0]["at"] == zfmt(10)
+    # 追溯登记：乙站 5~50 不可信 → 原 10 时刻的区域预警不再成立，重算后消失；
+    # 50 结束刻乙站仍预警 → 区域在 50 才预警
+    register_isolation(client, zone_id, s2, 5, 50)
+    tl = zone_timeline(client, zone_id)
+    assert [(e["type"], e["at"]) for e in tl["events"]] == [("warning", zfmt(50))]
+    assert tl["status"] == "warning"
+
+
+def test_isolation_initial_state_excluded_at_effective(client):
+    s1, d1 = make_station_with_device(client, "甲站", "D1")
+    s2, d2 = make_station_with_device(client, "乙站", "D2")
+    for d in (d1, d2):
+        for i, m in enumerate((0, 5, 10), start=1):
+            upload(client, d, i, m, 12.0)
+    zone_id = create_zone(client, [s1, s2], 60, 2).json()["id"]  # 生效 60，初始两站均预警
+    assert zone_timeline(client, zone_id)["events"][0]["at"] == zfmt(60)
+    # 乙站自生效时刻起隔离：初始不计入 → 生效时刻不再预警；100 结束刻重入后两站齐预警
+    register_isolation(client, zone_id, s2, 60, 100)
+    tl = zone_timeline(client, zone_id)
+    assert [(e["type"], e["at"]) for e in tl["events"]] == [("warning", zfmt(100))]
+
+
+def test_isolation_invalidates_publish_check_token(client):
+    s1, d1 = make_station_with_device(client, "甲站", "D1")
+    s2, d2 = make_station_with_device(client, "乙站", "D2")
+    zone_id = create_zone(client, [s1, s2], 0, 2).json()["id"]
+    for d in (d1, d2):
+        for i, m in enumerate((0, 5, 10), start=1):
+            upload(client, d, i, m, 12.0)
+    token = check(client)["token"]
+    register_isolation(client, zone_id, s2, 20, 40)
+    r = confirm(client, token)
+    assert r.status_code == 409
+    assert r.json()["detail"]["reason"] == "data_changed_after_check"
+    # 重新核对 → 确认成功
+    token2 = check(client)["token"]
+    assert confirm(client, token2).status_code == 201
+
+
+def test_isolation_public_snapshot_frozen_until_republish(client):
+    s1, d1 = make_station_with_device(client, "甲站", "D1")
+    s2, d2 = make_station_with_device(client, "乙站", "D2")
+    zone_id = create_zone(client, [s1, s2], 0, 2).json()["id"]
+    for d in (d1, d2):
+        for i, m in enumerate((0, 5, 10), start=1):
+            upload(client, d, i, m, 12.0)
+    pub1 = client.post("/publish").json()["publication_id"]
+    register_isolation(client, zone_id, s2, 20, 40)
+    # 待发布已重算，公开结果仍冻结为发布时刻
+    assert [e["type"] for e in zone_timeline(client, zone_id)["events"]] == [
+        "warning", "cleared", "warning",
+    ]
+    pub_zone = client.get(f"/public/zones/{zone_id}/timeline").json()
+    assert [(e["type"], e["at"]) for e in pub_zone["events"]] == [("warning", zfmt(10))]
+    # 重新发布后公开结果更新；历史发布快照不变
+    client.post("/publish")
+    pub_zone = client.get(f"/public/zones/{zone_id}/timeline").json()
+    assert [(e["type"], e["at"]) for e in pub_zone["events"]] == [
+        ("warning", zfmt(10)), ("cleared", zfmt(20)), ("warning", zfmt(40)),
+    ]
+    old = client.get(f"/publications/{pub1}").json()
+    assert [(e["type"], e["at"]) for e in old["zone_timelines"][0]["events"]] == [
+        ("warning", zfmt(10))
+    ]
+
+
+def test_isolation_downstream_release_diff(client):
+    s1, d1 = make_station_with_device(client, "甲站", "D1")
+    s2, d2 = make_station_with_device(client, "乙站", "D2")
+    zone_id = create_zone(client, [s1, s2], 0, 2).json()["id"]
+    for d in (d1, d2):
+        for i, m in enumerate((0, 5, 10), start=1):
+            upload(client, d, i, m, 12.0)
+    key = register_subscriber(client)["key"]
+    client.post("/publish")
+    # 追溯隔离后重新发布：区域变化进入下游批次差异
+    register_isolation(client, zone_id, s2, 20, 40)
+    client.post("/publish")
+    batch = pull(client, key, limit=10).json()["batch"]
+    assert pub_ids(batch) == [1, 2]
+    rel2 = batch["releases"][1]
+    zdiff = [z for z in rel2["zones"] if z["zone_id"] == zone_id][0]
+    assert zdiff["status_before"] == "warning"
+    assert zdiff["status_after"] == "warning"
+    assert [(e["type"], e["at"]) for e in zdiff["events_added"]] == [
+        ("cleared", zfmt(20)),
+        ("warning", zfmt(40)),
+    ]
+    assert zdiff["events_removed"] == []
+    flat = [(e["object_type"], e["object_id"], e["type"], e["at"]) for e in rel2["events_added"]]
+    assert ("zone", zone_id, "cleared", zfmt(20)) in flat
+    assert ("zone", zone_id, "warning", zfmt(40)) in flat
+    # 确认批次末尾编号后游标推进
+    assert ack(client, key, 2).status_code == 200
+
+
+def test_isolation_preview_zone_follows_isolation(client):
+    s1, d1 = make_station_with_device(client, "甲站", "D1")
+    s2, d2 = make_station_with_device(client, "乙站", "D2")
+    zone_id = create_zone(client, [s1, s2], 0, 2).json()["id"]
+    for i, m in enumerate((0, 5, 10), start=1):
+        upload(client, d1, i, m, 12.0)   # 甲站预警
+        upload(client, d2, i, m, 9.5)    # 乙站基准阈值 10 下不预警
+    register_isolation(client, zone_id, s1, 20, 40)
+    # 现状：甲站 20 退出、40 重入（1 < K=2）→ 区域始终正常
+    assert zone_timeline(client, zone_id)["events"] == []
+    # 预演乙站阈值降到 9：乙站 10 预警；甲站仍按既有隔离 20 退出、40 重入
+    r = client.post(
+        f"/stations/{s2}/threshold-versions/preview",
+        json={
+            "effective_at": iso(BASE),
+            "rise_threshold": 9.0,
+            "clear_threshold": 7.0,
+            "reason": "提级预演",
+        },
+    )
+    assert r.status_code == 200, r.text
+    z = [z for z in r.json()["zones"] if z["zone_id"] == zone_id][0]
+    assert z["current"]["events"] == []
+    assert [(e["type"], e["at"]) for e in z["preview"]["events"]] == [
+        ("warning", zfmt(10)),   # 10 两站齐预警（甲站隔离 20 才开始）
+        ("cleared", zfmt(20)),   # 20 甲站退出计数
+        ("warning", zfmt(40)),   # 40 甲站按该刻状态重入
+    ]
+    # 预演不落库：待发布区域仍无事件
+    assert zone_timeline(client, zone_id)["events"] == []

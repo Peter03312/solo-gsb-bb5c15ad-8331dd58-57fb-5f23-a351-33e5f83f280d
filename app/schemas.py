@@ -131,6 +131,35 @@ class ThresholdVersionCreate(BaseModel):
         return self
 
 
+class ZoneStationIsolationCreate(BaseModel):
+    """责任区成员站数据不可信：登记隔离时段。
+
+    区间 [start_at, end_at)：开始含、结束不含；隔离期间该站退出本责任区的
+    联动计数（本站裁定、其他责任区与触发站数 K 均不变）。
+    """
+
+    station_id: int = Field(description="成员监测站 ID（须属于该责任区）")
+    start_at: datetime = Field(description="带时区的隔离开始时刻（含），不得早于责任区生效时刻")
+    end_at: datetime = Field(description="带时区的隔离结束时刻（不含），须晚于开始时刻")
+    reason: str = Field(min_length=1, max_length=500, description="隔离原因（必填）")
+
+    _tz_start = field_validator("start_at")(_require_tz_aware)
+    _tz_end = field_validator("end_at")(_require_tz_aware)
+
+    @field_validator("reason")
+    @classmethod
+    def _reason_not_blank(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("不得为空白")
+        return v
+
+    @model_validator(mode="after")
+    def _end_after_start(self) -> "ZoneStationIsolationCreate":
+        if not self.end_at > self.start_at:
+            raise ValueError("结束时刻必须晚于开始时刻")
+        return self
+
+
 class ZoneCreate(BaseModel):
     """登记防汛责任区：非空名称、带时区生效时间、互不重复的成员站 ID、触发站数 K。"""
 
